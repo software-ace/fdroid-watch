@@ -33,3 +33,7 @@ Sources, all public, no tokens:
 - `f-droid.org/repo/status/build.json` (last build cycle) and `running.json` (current one)
 
 `cargo test` checks the parsing; `cargo test -- --ignored --nocapture` draws one live fetch as text.
+
+## License
+
+GPL-3.0-or-later, like Pocket Sense. See [LICENSE](LICENSE).
