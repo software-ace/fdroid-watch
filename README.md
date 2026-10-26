@@ -8,11 +8,13 @@ tagged on GitHub → picked up in fdroiddata by the update bot → built in a bu
 Needs Rust ([rustup](https://rustup.rs)).
 
 ```sh
-cargo install --path .
+cargo install --git https://github.com/software-ace/fdroid-watch
 fdroid-watch
 ```
 
-That builds it and puts `fdroid-watch` in `~/.cargo/bin`, or in `$CARGO_INSTALL_ROOT/bin` if that's set. That directory has to be on your `PATH` (fish: `fish_add_path ~/.cargo/bin`). Run the same `cargo install` again after changing the code; `cargo uninstall fdroid-watch` removes it.
+No clone needed: cargo fetches the source, builds it and puts `fdroid-watch` in `~/.cargo/bin`, or in `$CARGO_INSTALL_ROOT/bin` if that's set. That directory has to be on your `PATH` (fish: `fish_add_path ~/.cargo/bin`). Run the same command again to update; `cargo uninstall fdroid-watch` removes it.
+
+From a clone, `cargo install --path .` does the same with your local changes.
 
 To try it without installing: `cargo run`.
 
