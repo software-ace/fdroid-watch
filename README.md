@@ -3,9 +3,20 @@
 A terminal dashboard showing where each Pocket Sense release is on its way to F-Droid:
 tagged on GitHub → picked up in fdroiddata by the update bot → built in a build cycle → live on f-droid.org.
 
+## Install
+
+Needs Rust ([rustup](https://rustup.rs)).
+
 ```sh
-cargo run --release
+cargo install --path .
+fdroid-watch
 ```
+
+That builds it and puts `fdroid-watch` in `~/.cargo/bin`, or in `$CARGO_INSTALL_ROOT/bin` if that's set. That directory has to be on your `PATH` (fish: `fish_add_path ~/.cargo/bin`). Run the same `cargo install` again after changing the code; `cargo uninstall fdroid-watch` removes it.
+
+To try it without installing: `cargo run`.
+
+## Use
 
 It fetches on start and every 15 minutes in the background; `r` refreshes now, `q` quits.
 
