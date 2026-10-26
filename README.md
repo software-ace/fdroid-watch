@@ -9,7 +9,7 @@ cargo run --release
 
 It fetches on start and every 15 minutes in the background; `r` refreshes now, `q` quits.
 
-Each version has a cat walking its tag → bot → build → live track, with GitHub's release date and the date f-droid.org added it. The big cat shows the mood: hunting while fetching, napping while F-Droid takes its days, purring once the newest release is live, hissing if a build failed.
+Each version has a cat walking its tag → bot → build → live track, with GitHub's release date and the date f-droid.org added it, or an estimate (`~`): the GitHub date plus the median delay of past releases. The big cat shows the mood: hunting while fetching, napping while F-Droid takes its days, purring once the newest release is live, hissing if a build failed.
 
 Sources, all public, no tokens:
 

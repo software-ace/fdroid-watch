@@ -226,9 +226,14 @@ fn now_ms() -> u64 {
 
 /// "2026-10-25 18:10" UTC, from epoch milliseconds.
 fn fmt_ms(ms: u64) -> String {
-    let (days, secs) = ((ms / 1000) / 86400, (ms / 1000) % 86400);
-    // Howard Hinnant's civil_from_days.
-    let z = days as i64 + 719468;
+    let secs = (ms / 1000) % 86400;
+    format!("{} {:02}:{:02}", iso((ms / 1000 / 86400) as i64), secs / 3600, secs % 3600 / 60)
+}
+
+/// "2026-10-25" for a day number (days since 1970-01-01); Howard Hinnant's
+/// civil_from_days.
+fn iso(days: i64) -> String {
+    let z = days + 719468;
     let era = z.div_euclid(146097);
     let doe = z - era * 146097;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
@@ -236,7 +241,37 @@ fn fmt_ms(ms: u64) -> String {
     let mp = (5 * doy + 2) / 153;
     let (d, m) = (doy - (153 * mp + 2) / 5 + 1, if mp < 10 { mp + 3 } else { mp - 9 });
     let y = yoe + era * 400 + i64::from(m <= 2);
-    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", secs / 3600, secs % 3600 / 60)
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// The day number of "2026-10-25"; days_from_civil, the inverse of [iso].
+fn day_number(iso: &str) -> Option<i64> {
+    let mut p = iso.get(..10)?.split('-').map(|x| x.parse::<i64>().ok());
+    let (y, m, d) = (p.next()??, p.next()??, p.next()??);
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
+    Some(era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468)
+}
+
+/// The median days from a GitHub release to f-droid.org, over the
+/// releases that made it.
+fn typical_lag(d: &Data) -> Option<i64> {
+    let mut lags: Vec<i64> = d.fdroid_dates.iter()
+        .filter_map(|(n, fd)| Some(day_number(fd)? - day_number(d.github.get(n)?.as_ref()?)?))
+        .filter(|&lag| lag >= 0)
+        .collect();
+    lags.sort();
+    lags.get(lags.len() / 2).copied()
+}
+
+/// When a version not on f-droid.org yet should get there: its GitHub date
+/// (or today, for a bare tag) plus the typical lag; never before today.
+// ponytail: one median for every stage; weigh in the build cycle if it misleads.
+fn estimate(d: &Data, name: &str, today: i64) -> Option<i64> {
+    let from = d.github.get(name)?.as_deref().and_then(day_number).unwrap_or(today);
+    Some((from + typical_lag(d)?).max(today))
 }
 
 fn ago(ms: u64) -> String {
@@ -436,6 +471,7 @@ fn draw(f: &mut Frame, v: &View) {
     ]);
     f.render_widget(Paragraph::new(info).block(Block::bordered().title(" Pocket Sense on F-Droid ".bold())), info_area);
 
+    let today = (now_ms() / 1000 / 86400) as i64;
     let date = |s: Option<&String>| match s {
         Some(s) => Cell::from(format!("✓ {s}")).green(),
         None => Cell::from("·").dark_gray(),
@@ -464,7 +500,12 @@ fn draw(f: &mut Frame, v: &View) {
         Row::new(vec![
             Cell::from(n.clone()).bold(),
             gh,
-            date(d.fdroid_dates.get(n)),
+            match (d.fdroid_dates.get(n), estimate(d, n, today)) {
+                (Some(day), _) => date(Some(day)),
+                (None, Some(est)) if *st != Stage::Skipped && est <= today => Cell::from("~ any day").yellow().italic(),
+                (None, Some(est)) if *st != Stage::Skipped => Cell::from(format!("~ {}", iso(est))).yellow().italic(),
+                _ => date(None),
+            },
             Cell::from(codes_txt).fg(if codes.is_empty() { Color::DarkGray } else { Color::Reset }),
             Cell::from(journey(*st, v.frame, i)),
             Cell::from(stage_txt).fg(color),
@@ -476,7 +517,11 @@ fn draw(f: &mut Frame, v: &View) {
         Table::new(table_rows, widths)
             .header(Row::new(["Version", "GitHub", "F-Droid", "Codes", "tag    bot    build  live", "Stage"]).add_modifier(Modifier::BOLD).bottom_margin(1))
             .column_spacing(1)
-            .block(Block::bordered().title(if empty { " Releases: fetching… " } else { " Releases " })),
+            .block(Block::bordered().title(match typical_lag(d) {
+                _ if empty => " Releases: fetching… ".to_string(),
+                Some(lag) => format!(" Releases · ~ is an estimate: F-Droid usually takes {lag} days after GitHub "),
+                None => " Releases ".to_string(),
+            })),
         table,
     );
 
@@ -594,6 +639,26 @@ mod tests {
         assert_eq!(fmt_ms(0), "1970-01-01 00:00");
         assert_eq!(fmt_ms(1_792_707_022_000), "2026-10-22 22:10");
         assert!(version_key("2.10.0") > version_key("2.9.1"));
+        for day in ["1970-01-01", "2024-02-29", "2026-10-25", "2027-01-01"] {
+            assert_eq!(iso(day_number(day).unwrap()), day);
+        }
+    }
+
+    #[test]
+    fn estimates_from_the_median_lag() {
+        let mut d = Data::default();
+        for (n, gh, fd) in [("1.0", "2026-10-01", "2026-10-04"), ("1.1", "2026-10-10", "2026-10-15"), ("1.2", "2026-10-20", "2026-10-26")] {
+            d.github.insert(n.into(), Some(gh.into()));
+            d.fdroid_dates.insert(n.into(), fd.into());
+        }
+        d.github.insert("1.3".into(), Some("2026-10-26".into()));
+        d.github.insert("1.4".into(), None);
+        let today = day_number("2026-10-27").unwrap();
+        assert_eq!(typical_lag(&d), Some(5), "median of 3, 5 and 6");
+        assert_eq!(estimate(&d, "1.3", today).map(iso).as_deref(), Some("2026-10-31"));
+        assert_eq!(estimate(&d, "1.4", today).map(iso).as_deref(), Some("2026-11-01"), "a bare tag counts from today");
+        d.github.insert("1.3".into(), Some("2026-10-01".into()));
+        assert_eq!(estimate(&d, "1.3", today), Some(today), "late, but never in the past");
     }
 
     /// Draws one live fetch at a few frames: `cargo test -- --ignored --nocapture`.
