@@ -20,11 +20,11 @@ The latest unreleased code: `cargo install --git https://github.com/software-ace
 ## Use
 
 ```sh
-fdroid-watch <package-id>
+fdroid-watch                      # asks which app
 fdroid-watch org.fdroid.fdroid
 ```
 
-The package id is the one in the app's f-droid.org URL (`f-droid.org/packages/<package-id>/`). It fetches on start and every 15 minutes in the background; `r` refreshes now, `q` quits.
+The package id is the one in the app's f-droid.org URL (`f-droid.org/packages/<package-id>/`); pasting the whole link works too. It fetches on start and every 15 minutes in the background; `r` refreshes now, `p` switches to another app, `q` quits.
 
 Each version has a cat walking its tag → bot → build → live track, with the date it was released in the source repo and the date f-droid.org added it, or an estimate (`~`): the release date plus the median delay of past releases. The big cat shows the mood: hunting while fetching, napping while F-Droid takes its days, purring once the newest release is live, hissing if a build failed.
 

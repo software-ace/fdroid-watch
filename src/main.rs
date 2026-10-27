@@ -7,22 +7,23 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use ratatui::layout::{Constraint, Layout};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::layout::{Constraint, Flex, Layout};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table};
 use ratatui::{DefaultTerminal, Frame};
 use serde_json::Value;
 
-const USAGE: &str = "usage: fdroid-watch <package-id>    e.g. fdroid-watch org.fdroid.fdroid
+const USAGE: &str = "usage: fdroid-watch [package-id]    e.g. fdroid-watch org.fdroid.fdroid
 
 Shows where each release of an F-Droid app is on its way to f-droid.org:
 tagged in its source repo → picked up in fdroiddata → built → live.
 The source repo comes from the app's fdroiddata metadata (GitHub, GitLab,
 Codeberg and other Gitea/Forgejo hosts).
 
-Keys: r refresh, q quit.";
+With no package id, or on p, it asks for one (an f-droid.org link works too).
+Keys: r refresh, p package, q quit.";
 const AUTO_REFRESH: Duration = Duration::from_secs(15 * 60);
 /// One animation frame.
 const TICK: Duration = Duration::from_millis(120);
@@ -481,6 +482,8 @@ fn journey(st: Stage, frame: usize, seed: usize) -> Line<'static> {
 
 struct View<'a> {
     pkg: &'a str,
+    /// The package prompt's text, while it's open
+    input: Option<&'a str>,
     d: &'a Data,
     loading: bool,
     frame: usize,
@@ -527,7 +530,10 @@ fn draw(f: &mut Frame, v: &View) {
         Line::from(vec![label("Last build cycle"), Span::raw(cycle(&d.last))]),
         Line::from(vec![label("Build cycle now"), Span::raw(cycle(&d.running))]),
     ]);
-    let title = format!(" {} on F-Droid ", d.name.as_deref().unwrap_or(v.pkg));
+    let title = match d.name.as_deref().unwrap_or(v.pkg) {
+        "" => " F-Droid ".to_string(),
+        who => format!(" {who} on F-Droid "),
+    };
     f.render_widget(Paragraph::new(info).block(Block::bordered().title(title.bold())), info_area);
 
     let today = (now_ms() / 1000 / 86400) as i64;
@@ -599,20 +605,46 @@ fn draw(f: &mut Frame, v: &View) {
         let s = v.next_in.as_secs();
         Span::raw(format!("{checked} · next in {}:{:02}", s / 60, s % 60)).dark_gray()
     };
-    f.render_widget(
-        Line::from(vec![Span::raw(" r").bold(), Span::raw(" refresh   "), Span::raw("q").bold(), Span::raw(" quit   "), status]),
-        foot,
-    );
+    let key = |k: &'static str, what: &'static str| [Span::raw(k).bold(), Span::raw(what)];
+    let mut keys: Vec<Span> = [key(" r", " refresh   "), key("p", " package   "), key("q", " quit   ")].concat();
+    keys.push(status);
+    f.render_widget(Line::from(keys), foot);
+
+    if let Some(text) = v.input {
+        let [area] = Layout::horizontal([Constraint::Length(60)]).flex(Flex::Center).areas(f.area());
+        let [area] = Layout::vertical([Constraint::Length(6)]).flex(Flex::Center).areas(area);
+        let cursor = if v.frame / 4 % 2 == 0 { "█" } else { " " };
+        let hint = Line::from("e.g. org.fdroid.fdroid, or paste its f-droid.org link");
+        let lines = vec![
+            Line::from(vec![Span::raw("> ").dark_gray(), Span::raw(text).bold(), Span::raw(cursor)]),
+            Line::raw(""),
+            if text.is_empty() || pkg_id(text).is_some() { hint.dark_gray() } else { hint.yellow() },
+            Line::from(if v.pkg.is_empty() { "Enter watch · Esc quit" } else { "Enter watch · Esc cancel" }).dark_gray(),
+        ];
+        f.render_widget(Clear, area);
+        f.render_widget(Paragraph::new(lines).block(Block::bordered().title(" Which app? ".bold()).border_style(Style::new().fg(Color::Magenta))), area);
+    }
 }
 
-fn run(terminal: &mut DefaultTerminal, pkg: &str) -> std::io::Result<()> {
+/// A package id from what the user gave: the id itself, or an f-droid.org
+/// link to it. It goes into URLs, so only letters, digits, _ and dots pass.
+fn pkg_id(s: &str) -> Option<String> {
+    let s = s.trim();
+    let s = s.split_once("/packages/").map_or(s, |(_, rest)| rest);
+    let id = s.split(['/', '?', '#']).next()?;
+    (id.contains('.') && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')).then(|| id.to_string())
+}
+
+fn run(terminal: &mut DefaultTerminal, mut pkg: String) -> std::io::Result<()> {
     let start = Instant::now();
     let mut data = Data::default();
     let mut inbox: Option<Receiver<Data>> = None;
     // Fetch straight away; the screen animates while it runs.
     let mut next = Instant::now();
+    // No package yet: ask for one first.
+    let mut input = pkg.is_empty().then(String::new);
     loop {
-        if inbox.is_none() && Instant::now() >= next {
+        if inbox.is_none() && !pkg.is_empty() && Instant::now() >= next {
             let (tx, rx) = mpsc::channel();
             let pkg = pkg.to_string();
             thread::spawn(move || tx.send(fetch(&pkg)));
@@ -636,7 +668,8 @@ fn run(terminal: &mut DefaultTerminal, pkg: &str) -> std::io::Result<()> {
             }
         }
         let view = View {
-            pkg,
+            pkg: &pkg,
+            input: input.as_deref(),
             d: &data,
             loading: inbox.is_some(),
             frame: (start.elapsed().as_millis() / TICK.as_millis()) as usize,
@@ -645,12 +678,30 @@ fn run(terminal: &mut DefaultTerminal, pkg: &str) -> std::io::Result<()> {
         terminal.draw(|f| draw(f, &view))?;
         if event::poll(TICK)? {
             if let Event::Key(k) = event::read()? {
-                if k.kind == KeyEventKind::Press {
-                    match k.code {
-                        KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                        KeyCode::Char('r') if inbox.is_none() => next = Instant::now(),
-                        _ => {}
+                if k.kind != KeyEventKind::Press {
+                    continue;
+                }
+                if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
+                    return Ok(());
+                }
+                match (input.as_mut(), k.code) {
+                    (Some(text), KeyCode::Enter) => {
+                        if let Some(id) = pkg_id(text) {
+                            // A fetch still running is for the old package; its result is dropped with the inbox.
+                            (pkg, data, inbox, next, input) = (id, Data::default(), None, Instant::now(), None);
+                        }
                     }
+                    (Some(_), KeyCode::Esc) if pkg.is_empty() => return Ok(()),
+                    (Some(_), KeyCode::Esc) => input = None,
+                    (Some(text), KeyCode::Backspace) => {
+                        text.pop();
+                    }
+                    (Some(text), KeyCode::Char(c)) => text.push(c),
+                    (Some(_), _) => {}
+                    (None, KeyCode::Char('q') | KeyCode::Esc) => return Ok(()),
+                    (None, KeyCode::Char('r')) if inbox.is_none() => next = Instant::now(),
+                    (None, KeyCode::Char('p')) => input = Some(String::new()),
+                    (None, _) => {}
                 }
             }
         }
@@ -658,19 +709,19 @@ fn run(terminal: &mut DefaultTerminal, pkg: &str) -> std::io::Result<()> {
 }
 
 fn main() -> std::io::Result<()> {
-    let pkg = std::env::args().nth(1).unwrap_or_default();
-    match pkg.as_str() {
+    let arg = std::env::args().nth(1).unwrap_or_default();
+    let pkg = match arg.as_str() {
         "-h" | "--help" => return Ok(println!("{USAGE}")),
         "-V" | "--version" => return Ok(println!("fdroid-watch {}", env!("CARGO_PKG_VERSION"))),
-        // It goes into URLs; a package id is only letters, digits, _ and dots.
-        p if p.contains('.') && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.') => {}
-        _ => {
+        // None given: the screen asks for one.
+        "" => String::new(),
+        a => pkg_id(a).unwrap_or_else(|| {
             eprintln!("{USAGE}");
             std::process::exit(2);
-        }
-    }
+        }),
+    };
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, &pkg);
+    let result = run(&mut terminal, pkg);
     ratatui::restore();
     result
 }
@@ -692,6 +743,18 @@ mod tests {
         assert_eq!(meta_field(yml, "Repo").as_deref(), Some("https://github.com/software-ace/PocketSense.git"), "not RepoType");
         assert_eq!(meta_field(yml, "Name"), None, "not AutoName");
         assert_eq!(meta_field(yml, "AutoName").as_deref(), Some("Pocket Sense"));
+    }
+
+    #[test]
+    fn package_ids() {
+        let id = |s| pkg_id(s);
+        assert_eq!(id(" org.fdroid.fdroid ").as_deref(), Some("org.fdroid.fdroid"));
+        assert_eq!(id("https://f-droid.org/en/packages/org.fdroid.fdroid/").as_deref(), Some("org.fdroid.fdroid"));
+        assert_eq!(id("f-droid.org/packages/ace.software.pocketsense?x=1").as_deref(), Some("ace.software.pocketsense"));
+        assert_eq!(id("fdroid"), None, "no dot");
+        assert_eq!(id("org.fdroid/../x").as_deref(), Some("org.fdroid"), "only the first path segment");
+        assert_eq!(id("org.f%2e droid"), None, "only letters, digits, _ and dots");
+        assert_eq!(id(""), None);
     }
 
     #[test]
@@ -773,7 +836,7 @@ mod tests {
         let d = fetch(&pkg);
         for (frame, loading) in [(0, true), (7, false)] {
             let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 26)).unwrap();
-            t.draw(|f| draw(f, &View { pkg: &pkg, d: &d, loading, frame, next_in: AUTO_REFRESH })).unwrap();
+            t.draw(|f| draw(f, &View { pkg: &pkg, input: None, d: &d, loading, frame, next_in: AUTO_REFRESH })).unwrap();
             let buf = t.backend().buffer();
             for y in 0..buf.area.height {
                 println!("{}", (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>());
