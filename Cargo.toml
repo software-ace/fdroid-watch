@@ -8,6 +8,7 @@ repository = "https://github.com/software-ace/fdroid-watch"
 readme = "README.md"
 keywords = ["fdroid", "f-droid", "android", "tui", "release"]
 categories = ["command-line-utilities"]
+exclude = ["screenshots/", ".github/"]
 
 [dependencies]
 ratatui = "0.30.2"

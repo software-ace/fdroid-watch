@@ -8,6 +8,12 @@ tagged in its source repo → picked up in fdroiddata by the update bot → buil
 
 Works for any app in the main F-Droid repo whose source is on GitHub, GitLab, Codeberg or another Gitea/Forgejo host.
 
+![fdroid-watch watching Pocket Sense: 2.4.0 waiting for a build, 2.3.0 built, older versions live](screenshots/dashboard.png)
+
+Switching to another app with `p`; an f-droid.org link works as well as a package id:
+
+![The "Which app?" prompt over the dashboard](screenshots/prompt.png)
+
 ## Install
 
 Needs Rust ([rustup](https://rustup.rs)).
