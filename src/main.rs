@@ -1,5 +1,5 @@
-//! Where each Pocket Sense release is on its way to F-Droid:
-//! tagged on GitHub → picked up in fdroiddata → built → published.
+//! Where each release of an F-Droid app is on its way to f-droid.org:
+//! tagged in its source repo → picked up in fdroiddata → built → published.
 //! With cats.
 
 use std::collections::{BTreeMap, HashSet};
@@ -15,8 +15,14 @@ use ratatui::widgets::{Block, Cell, Paragraph, Row, Table};
 use ratatui::{DefaultTerminal, Frame};
 use serde_json::Value;
 
-const PKG: &str = "ace.software.pocketsense";
-const GH_REPO: &str = "software-ace/PocketSense";
+const USAGE: &str = "usage: fdroid-watch <package-id>    e.g. fdroid-watch org.fdroid.fdroid
+
+Shows where each release of an F-Droid app is on its way to f-droid.org:
+tagged in its source repo → picked up in fdroiddata → built → live.
+The source repo comes from the app's fdroiddata metadata (GitHub, GitLab,
+Codeberg and other Gitea/Forgejo hosts).
+
+Keys: r refresh, q quit.";
 const AUTO_REFRESH: Duration = Duration::from_secs(15 * 60);
 /// One animation frame.
 const TICK: Duration = Duration::from_millis(120);
@@ -32,9 +38,12 @@ struct Cycle {
 
 #[derive(Default)]
 struct Data {
-    /// versionName → its GitHub release date, or None for a tag without
-    /// a published release (yet)
-    github: BTreeMap<String, Option<String>>,
+    /// From fdroiddata: the app's name and source repo URL
+    name: Option<String>,
+    repo: Option<String>,
+    /// versionName → its release date in the source repo, or None for a tag
+    /// without a published release (yet)
+    tags: BTreeMap<String, Option<String>>,
     /// versionName → the date f-droid.org added it
     fdroid_dates: BTreeMap<String, String>,
     /// versionName → versionCodes, from fdroiddata and f-droid.org (which
@@ -61,34 +70,49 @@ fn get_json(url: &str) -> Result<Value, String> {
     serde_json::from_str(&get(url)?).map_err(|e| format!("{url}: {e}"))
 }
 
-fn fetch() -> Data {
+fn fetch(pkg: &str) -> Data {
     let mut d = Data { fetched_at: Some(now_ms()), ..Default::default() };
 
-    // Tags are what F-Droid's bot reacts to; releases add the date once the
-    // release workflow has published one.
-    for (what, key) in [("tags", "name"), ("releases", "tag_name")] {
-        match get_json(&format!("https://api.github.com/repos/{GH_REPO}/{what}?per_page=15")) {
-            Ok(Value::Array(items)) => {
-                for r in items {
-                    let name = r[key].as_str().unwrap_or_default().trim_start_matches('v').to_string();
-                    let date = r["published_at"].as_str().filter(|_| r["draft"] != true).and_then(|s| s.get(..10));
-                    let entry = d.github.entry(name).or_default();
-                    if let Some(date) = date {
-                        *entry = Some(date.to_string());
-                    }
-                }
-            }
-            Ok(other) => d.errors.push(format!("GitHub {what}: {}", other["message"].as_str().unwrap_or("unexpected reply"))),
-            Err(e) => d.errors.push(e),
+    // First: it names the source repo the tags come from.
+    match get(&format!("https://gitlab.com/fdroid/fdroiddata/-/raw/master/metadata/{pkg}.yml")) {
+        Ok(yml) => {
+            d.codes = parse_metadata(&yml);
+            d.current_version = meta_field(&yml, "CurrentVersion");
+            d.name = meta_field(&yml, "Name").or_else(|| meta_field(&yml, "AutoName"));
+            d.repo = meta_field(&yml, "Repo");
         }
-    }
-
-    match get(&format!("https://gitlab.com/fdroid/fdroiddata/-/raw/master/metadata/{PKG}.yml")) {
-        Ok(yml) => (d.codes, d.current_version) = parse_metadata(&yml),
+        Err(e) if e.contains("404") => d.errors.push(format!("{pkg} isn't in fdroiddata; check the package id")),
         Err(e) => d.errors.push(e),
     }
 
-    match get_json(&format!("https://f-droid.org/api/v1/packages/{PKG}")) {
+    // Tags are what F-Droid's bot reacts to; releases add the date once the
+    // project has published one.
+    match d.repo.as_deref().map(|r| (r, forge_urls(r))) {
+        Some((_, Some(urls))) => {
+            for (url, key) in urls.iter().zip(["name", "tag_name"]) {
+                match get_json(url) {
+                    Ok(Value::Array(items)) => {
+                        for r in items {
+                            let name = r[key].as_str().unwrap_or_default().trim_start_matches(|c: char| !c.is_ascii_digit()).to_string();
+                            let date = r["published_at"].as_str().or(r["released_at"].as_str())
+                                .filter(|_| r["draft"] != true && r["upcoming_release"] != true)
+                                .and_then(|s| s.get(..10));
+                            let entry = d.tags.entry(name).or_default();
+                            if let Some(date) = date {
+                                *entry = Some(date.to_string());
+                            }
+                        }
+                    }
+                    Ok(other) => d.errors.push(format!("{url}: {}", other["message"].as_str().unwrap_or("unexpected reply"))),
+                    Err(e) => d.errors.push(e),
+                }
+            }
+        }
+        Some((repo, None)) => d.errors.push(format!("can't read tags from {repo}")),
+        None => {}
+    }
+
+    match get_json(&format!("https://f-droid.org/api/v1/packages/{pkg}")) {
         Ok(v) => {
             d.suggested = v["suggestedVersionCode"].as_u64();
             for p in v["packages"].as_array().into_iter().flatten() {
@@ -108,7 +132,7 @@ fn fetch() -> Data {
     }
 
     // The JSON API has no dates; the package page does.
-    match get(&format!("https://f-droid.org/en/packages/{PKG}/")) {
+    match get(&format!("https://f-droid.org/en/packages/{pkg}/")) {
         Ok(html) => d.fdroid_dates = parse_added(&html),
         Err(e) if e.contains("404") => {}
         Err(e) => d.errors.push(e),
@@ -116,16 +140,16 @@ fn fetch() -> Data {
 
     for (file, cycle) in [("build", &mut d.last), ("running", &mut d.running)] {
         match get_json(&format!("https://f-droid.org/repo/status/{file}.json")) {
-            Ok(v) => *cycle = parse_cycle(&v),
+            Ok(v) => *cycle = parse_cycle(&v, pkg),
             Err(e) => d.errors.push(e),
         }
     }
     d
 }
 
-/// The `- versionName:` / `versionCode:` pairs under Builds, and CurrentVersion.
-fn parse_metadata(yml: &str) -> (BTreeMap<String, Vec<u64>>, Option<String>) {
-    let (mut builds, mut current, mut name) = (BTreeMap::<String, Vec<u64>>::new(), None, None::<String>);
+/// The `- versionName:` / `versionCode:` pairs under Builds.
+fn parse_metadata(yml: &str) -> BTreeMap<String, Vec<u64>> {
+    let (mut builds, mut name) = (BTreeMap::<String, Vec<u64>>::new(), None::<String>);
     for line in yml.lines() {
         let line = line.trim_start_matches([' ', '-']);
         let value = |key: &str| line.strip_prefix(key).map(|v| v.trim().trim_matches(['\'', '"']).to_string());
@@ -133,11 +157,32 @@ fn parse_metadata(yml: &str) -> (BTreeMap<String, Vec<u64>>, Option<String>) {
             name = Some(v);
         } else if let (Some(code), Some(n)) = (value("versionCode:").and_then(|c| c.parse().ok()), &name) {
             builds.entry(n.clone()).or_default().push(code);
-        } else if let Some(v) = value("CurrentVersion:") {
-            current = Some(v);
         }
     }
-    (builds, current)
+    builds
+}
+
+/// A top-level `Key: value` line of the metadata.
+fn meta_field(yml: &str, key: &str) -> Option<String> {
+    yml.lines()
+        .find_map(|l| l.strip_prefix(key)?.strip_prefix(':'))
+        .map(|v| v.trim().trim_matches(['\'', '"']).to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// The tags and releases API URLs for a source repo: GitHub, any GitLab, or
+/// else Gitea/Forgejo (Codeberg). All three answer with the fields `fetch`
+/// reads; each ignores the other's page-size parameter.
+fn forge_urls(repo: &str) -> Option<[String; 2]> {
+    let rest = repo.split_once("://")?.1.trim_end_matches('/').trim_end_matches(".git");
+    let (host, path) = rest.split_once('/')?;
+    let (base, tags) = match host {
+        "github.com" => (format!("https://api.github.com/repos/{path}"), "tags"),
+        h if h.contains("gitlab") => (format!("https://{h}/api/v4/projects/{}", path.replace('/', "%2F")), "repository/tags"),
+        h => (format!("https://{h}/api/v1/repos/{path}"), "tags"),
+    };
+    let q = "?per_page=15&limit=15";
+    Some([format!("{base}/{tags}{q}"), format!("{base}/releases{q}")])
 }
 
 /// versionName → "2026-10-25", from the package page's
@@ -166,10 +211,10 @@ fn iso_date(s: &str) -> Option<String> {
     Some(format!("{year}-{m:02}-{:02}", day.parse::<u8>().ok()?))
 }
 
-fn parse_cycle(v: &Value) -> Cycle {
+fn parse_cycle(v: &Value, pkg: &str) -> Cycle {
     let ours = |key: &str| -> HashSet<u64> {
         v[key].as_array().into_iter().flatten()
-            .filter(|b| b[0].as_str() == Some(PKG))
+            .filter(|b| b[0].as_str() == Some(pkg))
             .filter_map(|b| b[1].as_u64())
             .collect()
     };
@@ -177,7 +222,7 @@ fn parse_cycle(v: &Value) -> Cycle {
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
-enum Stage { Skipped, Tagged, Queued, Built, Failed, Live }
+enum Stage { Skipped, Archived, Tagged, Queued, Built, Failed, Live }
 
 fn stage(codes: &[u64], d: &Data) -> Stage {
     let all = |set: &HashSet<u64>| !codes.is_empty() && codes.iter().all(|c| set.contains(c));
@@ -202,22 +247,33 @@ fn rows(d: &Data) -> Vec<(String, Vec<u64>, Stage)> {
     // takes the newest tag it sees).
     let known: Vec<Vec<u64>> = d.codes.keys().map(|n| version_key(n)).collect();
     let (oldest, newest) = (known.iter().min(), known.iter().max());
-    let mut names: Vec<&String> = d.github.keys().chain(d.codes.keys()).collect::<HashSet<_>>().into_iter()
+    let mut names: Vec<&String> = d.tags.keys().chain(d.codes.keys()).collect::<HashSet<_>>().into_iter()
         .filter(|n| oldest.is_none_or(|o| version_key(n) >= *o))
         .collect();
-    names.sort_by_key(|n| std::cmp::Reverse(version_key(n)));
+    // versionCodes break ties the numbers can't: 2.0-alpha7 < 2.0-alpha10.
+    names.sort_by_key(|n| std::cmp::Reverse((version_key(n), d.codes.get(*n).and_then(|c| c.last().copied()))));
+    // f-droid.org keeps only the newest few versions; unpublished ones below
+    // a live one were moved to the archive repo, not waiting for anything.
+    let mut live_above = false;
     names.into_iter().map(|n| {
         let codes = d.codes.get(n).cloned().unwrap_or_default();
         let st = match stage(&codes, d) {
             Stage::Tagged if newest.is_some_and(|m| version_key(n) < *m) => Stage::Skipped,
+            Stage::Queued if live_above => Stage::Archived,
             st => st,
         };
+        live_above |= st == Stage::Live;
         (n.clone(), codes, st)
     }).collect()
 }
 
+/// "1.10.2-beta" → [1, 10, 2]: each part's leading number, so suffixes
+/// don't sort a version to 0.
 fn version_key(v: &str) -> Vec<u64> {
-    v.split('.').map(|p| p.parse().unwrap_or(0)).collect()
+    v.split('.').map(|p| {
+        let digits = p.find(|c: char| !c.is_ascii_digit()).unwrap_or(p.len());
+        p[..digits].parse().unwrap_or(0)
+    }).collect()
 }
 
 fn now_ms() -> u64 {
@@ -255,22 +311,22 @@ fn day_number(iso: &str) -> Option<i64> {
     Some(era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468)
 }
 
-/// The median days from a GitHub release to f-droid.org, over the
+/// The median days from a source release to f-droid.org, over the
 /// releases that made it.
 fn typical_lag(d: &Data) -> Option<i64> {
     let mut lags: Vec<i64> = d.fdroid_dates.iter()
-        .filter_map(|(n, fd)| Some(day_number(fd)? - day_number(d.github.get(n)?.as_ref()?)?))
+        .filter_map(|(n, fd)| Some(day_number(fd)? - day_number(d.tags.get(n)?.as_ref()?)?))
         .filter(|&lag| lag >= 0)
         .collect();
     lags.sort();
     lags.get(lags.len() / 2).copied()
 }
 
-/// When a version not on f-droid.org yet should get there: its GitHub date
+/// When a version not on f-droid.org yet should get there: its release date
 /// (or today, for a bare tag) plus the typical lag; never before today.
 // ponytail: one median for every stage; weigh in the build cycle if it misleads.
 fn estimate(d: &Data, name: &str, today: i64) -> Option<i64> {
-    let from = d.github.get(name)?.as_deref().and_then(day_number).unwrap_or(today);
+    let from = d.tags.get(name)?.as_deref().and_then(day_number).unwrap_or(today);
     Some((from + typical_lag(d)?).max(today))
 }
 
@@ -398,7 +454,7 @@ fn journey(st: Stage, frame: usize, seed: usize) -> Line<'static> {
     const WIDTH: usize = 26;
     const STOPS: [usize; 4] = [0, 7, 14, 21];
     let (at, face, color) = match st {
-        Stage::Skipped => return Line::from("┄".repeat(WIDTH)).dark_gray(),
+        Stage::Skipped | Stage::Archived => return Line::from("┄".repeat(WIDTH)).dark_gray(),
         Stage::Tagged => (0, "=^.^=", Color::Yellow),
         Stage::Queued => (1, "=^.^=", Color::Yellow),
         Stage::Built => (2, "=^.^=", Color::Cyan),
@@ -424,6 +480,7 @@ fn journey(st: Stage, frame: usize, seed: usize) -> Line<'static> {
 // ── Screen ──────────────────────────────────────────────────────────────
 
 struct View<'a> {
+    pkg: &'a str,
     d: &'a Data,
     loading: bool,
     frame: usize,
@@ -434,7 +491,7 @@ fn draw(f: &mut Frame, v: &View) {
     let d = v.d;
     let rows = rows(d);
     let [head, table, errs, foot] = Layout::vertical([
-        Constraint::Length(11),
+        Constraint::Length(12),
         Constraint::Min(5),
         Constraint::Length(if d.errors.is_empty() { 0 } else { d.errors.len() as u16 + 2 }),
         Constraint::Length(1),
@@ -463,13 +520,15 @@ fn draw(f: &mut Frame, v: &View) {
     let or_wait = |s: Option<String>| s.unwrap_or_else(|| if v.loading { "…".into() } else { "?".into() });
     info.extend([
         Line::raw(""),
-        Line::from(vec![label("Package"), Span::raw(PKG).bold()]),
+        Line::from(vec![label("Package"), Span::raw(v.pkg).bold()]),
+        Line::from(vec![label("Source"), Span::raw(or_wait(d.repo.clone()))]),
         Line::from(vec![label("Suggested build"), Span::raw(or_wait(d.suggested.map(|c| c.to_string())))]),
         Line::from(vec![label("fdroiddata"), Span::raw(format!("CurrentVersion {}", or_wait(d.current_version.clone())))]),
         Line::from(vec![label("Last build cycle"), Span::raw(cycle(&d.last))]),
         Line::from(vec![label("Build cycle now"), Span::raw(cycle(&d.running))]),
     ]);
-    f.render_widget(Paragraph::new(info).block(Block::bordered().title(" Pocket Sense on F-Droid ".bold())), info_area);
+    let title = format!(" {} on F-Droid ", d.name.as_deref().unwrap_or(v.pkg));
+    f.render_widget(Paragraph::new(info).block(Block::bordered().title(title.bold())), info_area);
 
     let today = (now_ms() / 1000 / 86400) as i64;
     let date = |s: Option<&String>| match s {
@@ -477,7 +536,7 @@ fn draw(f: &mut Frame, v: &View) {
         None => Cell::from("·").dark_gray(),
     };
     let table_rows = rows.iter().enumerate().map(|(i, (n, codes, st))| {
-        let gh = match d.github.get(n) {
+        let released = match d.tags.get(n) {
             Some(Some(day)) => date(Some(day)),
             Some(None) => Cell::from("tag only").yellow(),
             None => date(None),
@@ -490,6 +549,7 @@ fn draw(f: &mut Frame, v: &View) {
         let suggested = codes.iter().any(|c| Some(*c) == d.suggested);
         let (stage_txt, color) = match st {
             Stage::Skipped => ("skipped", Color::DarkGray),
+            Stage::Archived => ("archived", Color::DarkGray),
             Stage::Tagged => ("waiting for the bot", Color::Yellow),
             Stage::Queued => ("waiting for a build", Color::Yellow),
             Stage::Built => ("built, publishing soon", Color::Cyan),
@@ -499,11 +559,11 @@ fn draw(f: &mut Frame, v: &View) {
         };
         Row::new(vec![
             Cell::from(n.clone()).bold(),
-            gh,
+            released,
             match (d.fdroid_dates.get(n), estimate(d, n, today)) {
                 (Some(day), _) => date(Some(day)),
-                (None, Some(est)) if *st != Stage::Skipped && est <= today => Cell::from("~ any day").yellow().italic(),
-                (None, Some(est)) if *st != Stage::Skipped => Cell::from(format!("~ {}", iso(est))).yellow().italic(),
+                (None, Some(est)) if !matches!(st, Stage::Skipped | Stage::Archived) && est <= today => Cell::from("~ any day").yellow().italic(),
+                (None, Some(est)) if !matches!(st, Stage::Skipped | Stage::Archived) => Cell::from(format!("~ {}", iso(est))).yellow().italic(),
                 _ => date(None),
             },
             Cell::from(codes_txt).fg(if codes.is_empty() { Color::DarkGray } else { Color::Reset }),
@@ -511,15 +571,16 @@ fn draw(f: &mut Frame, v: &View) {
             Cell::from(stage_txt).fg(color),
         ])
     });
-    let widths = [Constraint::Length(7), Constraint::Length(12), Constraint::Length(12), Constraint::Length(9), Constraint::Length(28), Constraint::Min(15)];
+    let name_width = rows.iter().map(|r| r.0.chars().count()).max().unwrap_or(0).max(7) as u16;
+    let widths = [Constraint::Length(name_width), Constraint::Length(12), Constraint::Length(12), Constraint::Length(9), Constraint::Length(28), Constraint::Min(15)];
     let empty = rows.is_empty() && v.loading;
     f.render_widget(
         Table::new(table_rows, widths)
-            .header(Row::new(["Version", "GitHub", "F-Droid", "Codes", "tag    bot    build  live", "Stage"]).add_modifier(Modifier::BOLD).bottom_margin(1))
+            .header(Row::new(["Version", "Released", "F-Droid", "Codes", "tag    bot    build  live", "Stage"]).add_modifier(Modifier::BOLD).bottom_margin(1))
             .column_spacing(1)
             .block(Block::bordered().title(match typical_lag(d) {
                 _ if empty => " Releases: fetching… ".to_string(),
-                Some(lag) => format!(" Releases · ~ is an estimate: F-Droid usually takes {lag} days after GitHub "),
+                Some(lag) => format!(" Releases · ~ is an estimate: F-Droid usually takes {lag} day{} after a release ", if lag == 1 { "" } else { "s" }),
                 None => " Releases ".to_string(),
             })),
         table,
@@ -544,7 +605,7 @@ fn draw(f: &mut Frame, v: &View) {
     );
 }
 
-fn run(terminal: &mut DefaultTerminal) -> std::io::Result<()> {
+fn run(terminal: &mut DefaultTerminal, pkg: &str) -> std::io::Result<()> {
     let start = Instant::now();
     let mut data = Data::default();
     let mut inbox: Option<Receiver<Data>> = None;
@@ -553,7 +614,8 @@ fn run(terminal: &mut DefaultTerminal) -> std::io::Result<()> {
     loop {
         if inbox.is_none() && Instant::now() >= next {
             let (tx, rx) = mpsc::channel();
-            thread::spawn(move || tx.send(fetch()));
+            let pkg = pkg.to_string();
+            thread::spawn(move || tx.send(fetch(&pkg)));
             inbox = Some(rx);
         }
         if let Some(rx) = &inbox {
@@ -574,6 +636,7 @@ fn run(terminal: &mut DefaultTerminal) -> std::io::Result<()> {
             }
         }
         let view = View {
+            pkg,
             d: &data,
             loading: inbox.is_some(),
             frame: (start.elapsed().as_millis() / TICK.as_millis()) as usize,
@@ -595,8 +658,19 @@ fn run(terminal: &mut DefaultTerminal) -> std::io::Result<()> {
 }
 
 fn main() -> std::io::Result<()> {
+    let pkg = std::env::args().nth(1).unwrap_or_default();
+    match pkg.as_str() {
+        "-h" | "--help" => return Ok(println!("{USAGE}")),
+        "-V" | "--version" => return Ok(println!("fdroid-watch {}", env!("CARGO_PKG_VERSION"))),
+        // It goes into URLs; a package id is only letters, digits, _ and dots.
+        p if p.contains('.') && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.') => {}
+        _ => {
+            eprintln!("{USAGE}");
+            std::process::exit(2);
+        }
+    }
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal);
+    let result = run(&mut terminal, &pkg);
     ratatui::restore();
     result
 }
@@ -608,9 +682,25 @@ mod tests {
     #[test]
     fn metadata_pairs_names_with_codes() {
         let yml = "Builds:\n  - versionName: 2.3.0\n    versionCode: 5051\n  - versionName: '2.3.0'\n    versionCode: 5052\nCurrentVersion: 2.3.0\nCurrentVersionCode: 5053\n";
-        let (b, cur) = parse_metadata(yml);
-        assert_eq!(b["2.3.0"], vec![5051, 5052]);
-        assert_eq!(cur.as_deref(), Some("2.3.0"));
+        assert_eq!(parse_metadata(yml)["2.3.0"], vec![5051, 5052]);
+        assert_eq!(meta_field(yml, "CurrentVersion").as_deref(), Some("2.3.0"));
+    }
+
+    #[test]
+    fn metadata_fields() {
+        let yml = "AutoName: Pocket Sense\nRepoType: git\nRepo: https://github.com/software-ace/PocketSense.git\n";
+        assert_eq!(meta_field(yml, "Repo").as_deref(), Some("https://github.com/software-ace/PocketSense.git"), "not RepoType");
+        assert_eq!(meta_field(yml, "Name"), None, "not AutoName");
+        assert_eq!(meta_field(yml, "AutoName").as_deref(), Some("Pocket Sense"));
+    }
+
+    #[test]
+    fn forges() {
+        let tags = |repo| forge_urls(repo).map(|[t, _]| t);
+        assert_eq!(tags("https://github.com/software-ace/PocketSense.git").as_deref(), Some("https://api.github.com/repos/software-ace/PocketSense/tags?per_page=15&limit=15"));
+        assert_eq!(tags("https://gitlab.com/fdroid/fdroidclient").as_deref(), Some("https://gitlab.com/api/v4/projects/fdroid%2Ffdroidclient/repository/tags?per_page=15&limit=15"));
+        assert_eq!(tags("https://codeberg.org/Freeyourgadget/Gadgetbridge/").as_deref(), Some("https://codeberg.org/api/v1/repos/Freeyourgadget/Gadgetbridge/tags?per_page=15&limit=15"));
+        assert_eq!(tags("not a url"), None);
     }
 
     #[test]
@@ -635,10 +725,23 @@ mod tests {
     }
 
     #[test]
+    fn rows_sort_by_code_and_archive_old() {
+        let mut d = Data::default();
+        for (n, code) in [("2.0-alpha7", 7), ("2.0-alpha10", 10), ("2.0.0", 50), ("1.9", 5)] {
+            d.codes.insert(n.into(), vec![code]);
+        }
+        d.published.extend([10, 50]);
+        let got: Vec<(String, Stage)> = rows(&d).into_iter().map(|r| (r.0, r.2)).collect();
+        assert_eq!(got, [("2.0.0", Stage::Live), ("2.0-alpha10", Stage::Live), ("2.0-alpha7", Stage::Archived), ("1.9", Stage::Archived)]
+            .map(|(n, s)| (n.to_string(), s)));
+    }
+
+    #[test]
     fn dates() {
         assert_eq!(fmt_ms(0), "1970-01-01 00:00");
         assert_eq!(fmt_ms(1_792_707_022_000), "2026-10-22 22:10");
         assert!(version_key("2.10.0") > version_key("2.9.1"));
+        assert!(version_key("1.10.0-beta") > version_key("1.9.3"));
         for day in ["1970-01-01", "2024-02-29", "2026-10-25", "2027-01-01"] {
             assert_eq!(iso(day_number(day).unwrap()), day);
         }
@@ -648,27 +751,29 @@ mod tests {
     fn estimates_from_the_median_lag() {
         let mut d = Data::default();
         for (n, gh, fd) in [("1.0", "2026-10-01", "2026-10-04"), ("1.1", "2026-10-10", "2026-10-15"), ("1.2", "2026-10-20", "2026-10-26")] {
-            d.github.insert(n.into(), Some(gh.into()));
+            d.tags.insert(n.into(), Some(gh.into()));
             d.fdroid_dates.insert(n.into(), fd.into());
         }
-        d.github.insert("1.3".into(), Some("2026-10-26".into()));
-        d.github.insert("1.4".into(), None);
+        d.tags.insert("1.3".into(), Some("2026-10-26".into()));
+        d.tags.insert("1.4".into(), None);
         let today = day_number("2026-10-27").unwrap();
         assert_eq!(typical_lag(&d), Some(5), "median of 3, 5 and 6");
         assert_eq!(estimate(&d, "1.3", today).map(iso).as_deref(), Some("2026-10-31"));
         assert_eq!(estimate(&d, "1.4", today).map(iso).as_deref(), Some("2026-11-01"), "a bare tag counts from today");
-        d.github.insert("1.3".into(), Some("2026-10-01".into()));
+        d.tags.insert("1.3".into(), Some("2026-10-01".into()));
         assert_eq!(estimate(&d, "1.3", today), Some(today), "late, but never in the past");
     }
 
-    /// Draws one live fetch at a few frames: `cargo test -- --ignored --nocapture`.
+    /// Draws one live fetch at a few frames: `cargo test -- --ignored --nocapture`;
+    /// FDROID_WATCH_PKG picks the app.
     #[test]
     #[ignore = "network"]
     fn live_render() {
-        let d = fetch();
+        let pkg = std::env::var("FDROID_WATCH_PKG").unwrap_or("ace.software.pocketsense".into());
+        let d = fetch(&pkg);
         for (frame, loading) in [(0, true), (7, false)] {
-            let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 25)).unwrap();
-            t.draw(|f| draw(f, &View { d: &d, loading, frame, next_in: AUTO_REFRESH })).unwrap();
+            let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 26)).unwrap();
+            t.draw(|f| draw(f, &View { pkg: &pkg, d: &d, loading, frame, next_in: AUTO_REFRESH })).unwrap();
             let buf = t.backend().buffer();
             for y in 0..buf.area.height {
                 println!("{}", (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>());

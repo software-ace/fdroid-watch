@@ -383,7 +383,6 @@ name = "fdroid-watch"
 version = "0.1.0"
 dependencies = [
  "ratatui",
- "serde",
  "serde_json",
  "ureq",
 ]

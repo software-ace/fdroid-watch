@@ -3,9 +3,13 @@ name = "fdroid-watch"
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
+description = "Terminal dashboard showing where each release of an F-Droid app is: tagged → picked up by the bot → built → live on f-droid.org"
+repository = "https://github.com/software-ace/fdroid-watch"
+readme = "README.md"
+keywords = ["fdroid", "f-droid", "android", "tui", "release"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 ratatui = "0.30.2"
-serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 ureq = "3.5.0"
