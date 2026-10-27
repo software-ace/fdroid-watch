@@ -1,6 +1,7 @@
 # fdroid-watch
 
 [![Sponsor](https://img.shields.io/github/sponsors/software-ace?label=Sponsor&logo=GitHub%20Sponsors&color=ea4aaa)](https://github.com/sponsors/software-ace)
+[![crates.io](https://img.shields.io/crates/v/fdroid-watch?logo=rust)](https://crates.io/crates/fdroid-watch)
 
 A terminal dashboard showing where each release of an F-Droid app is on its way to f-droid.org:
 tagged in its source repo → picked up in fdroiddata by the update bot → built in a build cycle → live on f-droid.org.
