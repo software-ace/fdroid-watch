@@ -46,6 +46,16 @@ GitHub allows 60 unauthenticated API calls an hour per IP; fdroid-watch makes 2 
 
 `cargo test` checks the parsing; `cargo test -- --ignored --nocapture` draws one live fetch as text, for the app in `FDROID_WATCH_PKG` (default `ace.software.pocketsense`).
 
+## Releasing
+
+Bump `version` in `Cargo.toml`, commit, push, then tag and push the tag:
+
+```sh
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+The Release workflow checks the tag matches `Cargo.toml`, runs the tests, publishes to crates.io (trusted publishing, no stored token) and makes the GitHub release with notes from the commits since the last tag.
+
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).

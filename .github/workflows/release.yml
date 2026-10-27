@@ -1,0 +1,37 @@
+# Pushing a v* tag publishes that version to crates.io and makes a GitHub
+# release with notes from the commits since the previous tag.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write # the GitHub release
+      id-token: write # crates.io trusted publishing, no stored token
+    steps:
+      - uses: actions/checkout@v7
+
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Tag matches Cargo.toml
+        run: |
+          want=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          [ "${GITHUB_REF_NAME#v}" = "$want" ] || { echo "tag $GITHUB_REF_NAME, Cargo.toml $want"; exit 1; }
+
+      - run: cargo test --locked
+
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
+      - run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+      - run: gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes --title "fdroid-watch ${GITHUB_REF_NAME#v}"
+        env:
+          GH_TOKEN: ${{ github.token }}
