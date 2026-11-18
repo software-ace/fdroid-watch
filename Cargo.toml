@@ -1,6 +1,6 @@
 [package]
 name = "fdroid-watch"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "GPL-3.0-or-later"
 description = "Terminal dashboard showing where each release of an F-Droid app is: tagged → picked up by the bot → built → live on f-droid.org"
