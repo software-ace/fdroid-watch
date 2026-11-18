@@ -52,6 +52,8 @@ struct Data {
     codes: BTreeMap<String, Vec<u64>>,
     current_version: Option<String>,
     published: HashSet<u64>,
+    /// The f-droid.org API failed, so `published` says nothing
+    published_unknown: bool,
     suggested: Option<u64>,
     last: Cycle,
     running: Cycle,
@@ -82,7 +84,7 @@ fn fetch(pkg: &str) -> Data {
             d.name = meta_field(&yml, "Name").or_else(|| meta_field(&yml, "AutoName"));
             d.repo = meta_field(&yml, "Repo");
         }
-        Err(e) if e.contains("404") => d.errors.push(format!("{pkg} isn't in fdroiddata; check the package id")),
+        Err(e) if e.ends_with("status: 404") => d.errors.push(format!("{pkg} isn't in fdroiddata; check the package id")),
         Err(e) => d.errors.push(e),
     }
 
@@ -128,14 +130,17 @@ fn fetch(pkg: &str) -> Data {
             }
         }
         // Not on f-droid.org yet is a 404, not an error worth showing.
-        Err(e) if e.contains("404") => {}
-        Err(e) => d.errors.push(e),
+        Err(e) if e.ends_with("status: 404") => {}
+        Err(e) => {
+            d.published_unknown = true;
+            d.errors.push(e);
+        }
     }
 
     // The JSON API has no dates; the package page does.
     match get(&format!("https://f-droid.org/en/packages/{pkg}/")) {
         Ok(html) => d.fdroid_dates = parse_added(&html),
-        Err(e) if e.contains("404") => {}
+        Err(e) if e.ends_with("status: 404") => {}
         Err(e) => d.errors.push(e),
     }
 
@@ -223,7 +228,7 @@ fn parse_cycle(v: &Value, pkg: &str) -> Cycle {
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
-enum Stage { Skipped, Archived, Tagged, Queued, Built, Failed, Live }
+enum Stage { Skipped, Archived, Unknown, Tagged, Queued, Built, Failed, Live }
 
 fn stage(codes: &[u64], d: &Data) -> Stage {
     let all = |set: &HashSet<u64>| !codes.is_empty() && codes.iter().all(|c| set.contains(c));
@@ -234,6 +239,9 @@ fn stage(codes: &[u64], d: &Data) -> Stage {
         Stage::Failed
     } else if any(&d.last.built) || any(&d.running.built) {
         Stage::Built
+    } else if !codes.is_empty() && d.published_unknown {
+        // It may well be live; f-droid.org didn't say.
+        Stage::Unknown
     } else if !codes.is_empty() {
         Stage::Queued
     } else {
@@ -455,7 +463,7 @@ fn journey(st: Stage, frame: usize, seed: usize) -> Line<'static> {
     const WIDTH: usize = 26;
     const STOPS: [usize; 4] = [0, 7, 14, 21];
     let (at, face, color) = match st {
-        Stage::Skipped | Stage::Archived => return Line::from("┄".repeat(WIDTH)).dark_gray(),
+        Stage::Skipped | Stage::Archived | Stage::Unknown => return Line::from("┄".repeat(WIDTH)).dark_gray(),
         Stage::Tagged => (0, "=^.^=", Color::Yellow),
         Stage::Queued => (1, "=^.^=", Color::Yellow),
         Stage::Built => (2, "=^.^=", Color::Cyan),
@@ -556,8 +564,11 @@ fn draw(f: &mut Frame, v: &View) {
         let (stage_txt, color) = match st {
             Stage::Skipped => ("skipped", Color::DarkGray),
             Stage::Archived => ("archived", Color::DarkGray),
+            Stage::Unknown => ("unknown: f-droid.org didn't answer", Color::DarkGray),
             Stage::Tagged => ("waiting for the bot", Color::Yellow),
             Stage::Queued => ("waiting for a build", Color::Yellow),
+            // It may be live already; f-droid.org didn't say.
+            Stage::Built if d.published_unknown => ("built", Color::Cyan),
             Stage::Built => ("built, publishing soon", Color::Cyan),
             Stage::Failed => ("build failed", Color::Red),
             Stage::Live if suggested => ("live, suggested", Color::Green),
@@ -779,6 +790,9 @@ mod tests {
         let mut d = Data::default();
         assert_eq!(stage(&[], &d), Stage::Tagged);
         assert_eq!(stage(&[1, 2], &d), Stage::Queued);
+        d.published_unknown = true;
+        assert_eq!(stage(&[1, 2], &d), Stage::Unknown, "not 'waiting' when f-droid.org is down");
+        d.published_unknown = false;
         d.last.failed.insert(1);
         assert_eq!(stage(&[1, 2], &d), Stage::Failed);
         d.running.built.insert(1);
